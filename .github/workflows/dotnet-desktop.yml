@@ -40,50 +40,246 @@ name: .NET Core Desktop
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - '**'
+    tags:
+      - '*.*.*'
+
   pull_request:
-    branches: [ "main" ]
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROJECT_FILE: Eco.Systems.Permissions/Eco.Systems.Permissions.csproj
+
+  ARTIFACTS_RETENTION_DAYS: 30
+  TEST_RESULTS_DIR: TestResults
+  PUBLISH_DIR: publish
+
+  # Placeholder versions used by branch/PR builds (CI validation only).
+  # Tag builds derive all three from the tag name — see the `package` job.
+  PACKAGE_VERSION: 0.0.0
+  ASSEMBLY_VERSION: 0.0.0
+  FILE_VERSION: 0.0.0
 
 jobs:
 
+  # 
+  # Build job — runs on every branch push and pull request (not on tags).
+  #
+  # Configuration rules:
+  #   - main branch  → Release
+  #   - other branch → Debug
+  #   - pull request → Debug
+  #
+  # Purpose: compile, test, and publish for CI feedback.
+  # Versioning here uses placeholder values; real versioning happens in `package`.
+  # 
   build:
+    if: github.ref_type == 'branch'
 
     strategy:
       matrix:
-        configuration: [Debug, Release]
+        include:
+          - eco: "0.11"
+            dotnet: "8.0.x"
+            framework: "net8.0"
 
-    runs-on: windows-latest  # For a list of available runner types, refer to
-                             # https://help.github.com/en/actions/reference/workflow-syntax-for-github-actions#jobsjob_idruns-on
+          - eco: "0.12"
+            dotnet: "8.0.x"
+            framework: "net8.0"
 
-    env:
-      Solution_Name: Eco.Systems.Permissions.Sln                        # Replace with your solution name, i.e. MyWpfApp.sln.
-      Test_Project_Path: your-test-project-path                 # Replace with the path to your test project, i.e. MyWpfApp.Tests\MyWpfApp.Tests.csproj.
-      Wap_Project_Directory: your-wap-project-directory-name    # Replace with the Wap project directory relative to the solution, i.e. MyWpfApp.Package.
-      Wap_Project_Path: your-wap-project-path                   # Replace with the path to your Wap project, i.e. MyWpf.App.Package\MyWpfApp.Package.wapproj.
+          - eco: "0.13"
+            dotnet: "10.0.x"
+            framework: "net10.0"
+
+    runs-on: windows-2025
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
 
-    # Install the .NET Core workload
-    - name: Install .NET Core
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: 8.0.x
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-    # Add  MSBuild to the PATH: https://github.com/microsoft/setup-msbuild
-    - name: Setup MSBuild.exe
-      uses: microsoft/setup-msbuild@v2
+      # Release only on main; everything else (branches, PRs) uses Debug.
+      - name: Determine build configuration
+        id: config
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/heads/main ]]; then
+            echo "configuration=Release" >> $GITHUB_OUTPUT
+          else
+            echo "configuration=Debug" >> $GITHUB_OUTPUT
+          fi
 
-    # Execute all unit tests in the solution
-    - name: Execute unit tests
-      run: dotnet test
+      - name: Install .NET Core
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.dotnet }}
 
-    # Restore the application to populate the obj folder with RuntimeIdentifiers
-    - name: Restore the application
-      run: msbuild $env:Solution_Name /t:Restore /p:Configuration=$env:Configuration
-      env:
-        Configuration: ${{ matrix.configuration }}
+      - name: Cache NuGet packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/*.sln', '**/Directory.Packages.props') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
 
+      # Build BEFORE test so --no-build is valid in the test step.
+      - name: Build the application
+        shell: bash
+        run: |
+          dotnet build ${{ env.PROJECT_FILE }} \
+            --configuration ${{ steps.config.outputs.configuration }} \
+            --property:Version=${{ env.PACKAGE_VERSION }} \
+            --property:AssemblyVersion=${{ env.ASSEMBLY_VERSION }} \
+            --property:FileVersion=${{ env.FILE_VERSION }} \
+            --property:InformationalVersion="${GITHUB_SHA::7}" \
+            --property:EcoVersion=${{ matrix.eco }}
+
+      - name: Execute unit tests
+        shell: bash
+        run: |
+          dotnet test ${{ env.PROJECT_FILE }} \
+            --configuration ${{ steps.config.outputs.configuration }} \
+            --no-build \
+            --logger "trx" \
+            --results-directory ${{ env.TEST_RESULTS_DIR }} \
+            --property:EcoVersion=${{ matrix.eco }}
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: test-results-eco${{ matrix.eco }}
+          path: ${{ env.TEST_RESULTS_DIR }}
+          retention-days: ${{ env.ARTIFACTS_RETENTION_DAYS }}
+
+      - name: Publish
+        shell: bash
+        run: |
+          dotnet publish ${{ env.PROJECT_FILE }} \
+            --configuration ${{ steps.config.outputs.configuration }} \
+            --no-build \
+            --output ${{ env.PUBLISH_DIR }} \
+            --property:EcoVersion=${{ matrix.eco }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Eco.Systems.Permissions-eco${{ matrix.eco }}-${{ steps.config.outputs.configuration }}
+          path: ${{ env.PUBLISH_DIR }}
+          retention-days: ${{ env.ARTIFACTS_RETENTION_DAYS }}
+
+  # 
+  # Package job — runs only on tag pushes (*.*.*).
+  #
+  # The tag name (e.g. 1.2.3) is used as the authoritative version for all
+  # three assembly metadata properties (Version, AssemblyVersion, FileVersion)
+  # as well as the zip filename. This requires a full Release build so the
+  # version is correctly embedded in the DLL.
+  #
+  # NuGet packages are restored from cache (same key as the build job), so the
+  # compile step itself is fast even though it is a clean build.
+  #
+  # Output artifact per eco target:
+  #   Eco.Systems.Permissions-<tag>-eco<X.XX>.zip
+  #     └ Mods/
+  #           └ ESP/
+  #                 └ Eco.Systems.Permissions.dll
+  # 
+  package:
+    if: github.ref_type == 'tag'
+
+    strategy:
+      matrix:
+        include:
+          - eco: "0.11"
+            dotnet: "8.0.x"
+            framework: "net8.0"
+
+          - eco: "0.12"
+            dotnet: "8.0.x"
+            framework: "net8.0"
+
+          - eco: "0.13"
+            dotnet: "10.0.x"
+            framework: "net10.0"
+
+    runs-on: windows-2025
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # Strip the refs/tags/ prefix → bare version string (e.g. "1.2.3").
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Install .NET Core
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ matrix.dotnet }}
+
+      # Reuse NuGet packages cached by the build job (same cache key).
+      - name: Restore NuGet cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/*.sln', '**/Directory.Packages.props') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      # Full Release build with tag-derived versions so the embedded DLL
+      # metadata (Version, AssemblyVersion, FileVersion) matches the tag exactly.
+      - name: Build Release
+        shell: bash
+        run: |
+          dotnet build ${{ env.PROJECT_FILE }} \
+            --configuration Release \
+            --property:Version=${{ steps.version.outputs.version }} \
+            --property:AssemblyVersion=${{ steps.version.outputs.version }} \
+            --property:FileVersion=${{ steps.version.outputs.version }} \
+            --property:InformationalVersion="${GITHUB_SHA::7}" \
+            --property:EcoVersion=${{ matrix.eco }}
+
+      # Pick the single DLL, stage it under the Eco mod layout, and zip.
+      #
+      # Internal zip structure:
+      #   Mods/ESP/Eco.Systems.Permissions.dll
+      - name: Create mod archive
+        id: archive
+        shell: pwsh
+        run: |
+          $version   = "${{ steps.version.outputs.version }}"
+          $dllSource = "Eco.Systems.Permissions/bin/Release/${{ matrix.framework }}/Eco.Systems.Permissions.dll"
+          $staging   = "dist"
+          $modDir    = "$staging/Mods/ESP"
+          $zipName   = "Eco.Systems.Permissions-$version-eco${{ matrix.eco }}.zip"
+
+          New-Item -ItemType Directory -Force -Path $modDir | Out-Null
+          Copy-Item $dllSource "$modDir/Eco.Systems.Permissions.dll"
+          Compress-Archive -Path "$staging/Mods" -DestinationPath $zipName
+
+          echo "zip_name=$zipName" >> $env:GITHUB_OUTPUT
+
+      - name: Upload mod archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: Eco.Systems.Permissions-${{ steps.version.outputs.version }}-eco${{ matrix.eco }}
+          path: ${{ steps.archive.outputs.zip_name }}
+          retention-days: ${{ env.ARTIFACTS_RETENTION_DAYS }}

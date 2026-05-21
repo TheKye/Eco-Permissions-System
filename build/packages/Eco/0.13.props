@@ -1,0 +1,6 @@
+<Project>
+  <ItemGroup>
+    <PackageVersion Include="Eco.ReferenceAssemblies" Version="0.13.0.3-beta-release-1015" />
+  </ItemGroup>
+</Project>
+

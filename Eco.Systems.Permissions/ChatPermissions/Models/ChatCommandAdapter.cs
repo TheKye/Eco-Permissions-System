@@ -21,7 +21,7 @@ namespace Eco.Systems.Permissions.Permissions
         public ChatCommandAdapter(ChatCommand c)
         {
             Identifier = c.Name.ToLower();
-            ShortCut = c.ShortCut.ToLower();
+            ShortCut = c.ShortCut?.ToLower();
 
         }
 
